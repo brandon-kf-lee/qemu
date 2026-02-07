@@ -87,6 +87,7 @@ enum {
     VIRT_PCIE_PIO,
     VIRT_PLATFORM_BUS,
     VIRT_PCIE_ECAM,
+    VIRT_SC_DEV,
     VIRT_IOMMU_SYS,
 };
 
