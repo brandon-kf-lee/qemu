@@ -11,6 +11,7 @@
 #include "hw/sysbus.h"  		 /* Provides all sysbus registering functions */
 #include "hw/qdev-properties.h"  /* QEMU device properties */
 #include "system/dma.h"          /* DMA functions */
+#include "qemu/timer.h"         /* Timer functions */
 
 #include "hw/misc/sc_dev.h"
 
@@ -24,12 +25,15 @@ DECLARE_INSTANCE_CHECKER(ScDevState, SC_DEV, TYPE_SC_DEV)
 /* DMA */
 #define DMA_BUFFER_SIZE 4096   // 4KB
 
-#define DMA_CONTROL   0x20
-#define DMA_SRC_LO    0x24
-#define DMA_SRC_HI    0x28
-#define DMA_DST       0x2C
-#define DMA_LEN       0x30 
-#define DMA_STAT      0x34 
+#define DMA_CONTROL   0x20     // DMA control
+#define DMA_SRC_LO    0x24     // Lower 32-bits of 64-bit address (Guest RAM)
+#define DMA_SRC_HI    0x28     // Upper 32-bits of 64-bit address (Guest RAM)
+#define DMA_DST       0x2C     // 32-bit address (Device SRAM)
+#define DMA_LEN       0x30     // Length of transfer
+#define DMA_STAT      0x34     // DMA status
+
+#define REG_EXCESS_TIME_LO  0x40  // SystemC simulator time correction (upper 32-bits)
+#define REG_EXCESS_TIME_HI  0x44  // SystemC simulator time correction (lower 32-bits)
 
 #define DMA_START     (1 << 0)
 #define DMA_BUSY      (1 << 0)
@@ -68,6 +72,9 @@ struct ScDevState {
 	/* Socket connection to external device */
     int sc_sock;
     char *socket_path;
+
+    /* Accumulated "excess" time due to simulated SystemC time being faster than wall-clock time */
+    int64_t excess_time_ns; 
 };
 
 struct bridge_msg {
@@ -79,6 +86,7 @@ struct bridge_msg {
     uint32_t size;
 
     uint8_t  data[DMA_BUFFER_SIZE];
+    int64_t simulated_ns;
 
     int8_t status;
 } __attribute__((packed));  /* Ensure no padding */
@@ -96,10 +104,12 @@ static int8_t sc_dev_tlm_transaction(ScDevState *state,
         .is_dma = is_dma,
         .addr = addr,
         .size = size,
+        .simulated_ns = 0,
         .status = 0,  /* Code for incomplete message */
     };    
     struct bridge_msg response;
     ssize_t ret;
+    int64_t t_before, t_after, t_delta; // Used to correct for simulated time
 
     /* Copy data buffer into message if writing */
     if (is_write && buf) {
@@ -111,6 +121,9 @@ static int8_t sc_dev_tlm_transaction(ScDevState *state,
         qemu_log_mask(LOG_GUEST_ERROR, "sc_dev: socket not connected\n");
         return -1;
     }
+
+    /* Mark time before entering SystemC time */
+    t_before = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     /* Send request, error if message wasn't sent */
     ret = send(state->sc_sock, &msg, sizeof(msg), 0);
@@ -125,7 +138,17 @@ static int8_t sc_dev_tlm_transaction(ScDevState *state,
         qemu_log_mask(LOG_GUEST_ERROR, "sc_dev: failed to receive TLM response\n");
         return -1;
     }
-    
+
+    /* Mark time after returning from SystemC time */
+    t_after = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    t_delta = t_after - t_before;
+
+    /* Accumulate correction for excess: wall clock time - simulated time */
+    state->excess_time_ns += t_delta - response.simulated_ns;
+
+    qemu_log("sc_dev: txn %lu ns, socket overhead & waiting %lu ns\n", 
+              response.simulated_ns, t_delta);
+
     /* Copy response data back to caller's buffer (for reads) */
     if (!is_write && buf) {
         memcpy((void*)buf, response.data, size);
@@ -143,6 +166,12 @@ static uint64_t sc_dev_read(void *opaque, hwaddr addr, unsigned int size)
         //case REG_ID:
         //    return state->chip_id;
 
+        case REG_EXCESS_TIME_LO:
+            return (uint32_t)(state->excess_time_ns);
+        
+        case REG_EXCESS_TIME_HI:
+            return (uint32_t)(state->excess_time_ns >> 32);
+
         case DMA_STAT:
             return state->dma_stat;
 
@@ -158,6 +187,9 @@ static uint64_t sc_dev_read(void *opaque, hwaddr addr, unsigned int size)
                               (unsigned long)addr, ret);
                 return 0; // TODO: figue out a way to return the TLM error number or some other defined (non-negative) error value
             }
+
+            // TODO: Handle IRQ signal raise/lower
+
             memcpy(&data, buf, sizeof(uint32_t));
             return data;
     }
@@ -209,6 +241,9 @@ static void sc_dev_write(void *opaque, hwaddr addr,
                               "sc_dev: TLM write error at 0x%lx: %d\n",
                               (unsigned long)addr, ret);
             }
+
+            // TODO: Handle IRQ signal raise/lower
+
             break;
     }
 }
@@ -318,7 +353,7 @@ static void sc_dev_realize(DeviceState *dev, Error **errp)
     state->dma_ctrl = 0;  
     state->dma_stat = 0; 
     
-    qemu_log("sc_dev: DMA intialized");
+    qemu_log("sc_dev: DMA intialized\n");
 }
 
 /* Device unrealization (socket cleanup) */
