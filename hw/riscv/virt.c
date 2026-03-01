@@ -1129,6 +1129,36 @@ static void create_fdt_iommu(RISCVVirtState *s, uint16_t bdf)
     s->pci_iommu_bdf = bdf;
 }
 
+static void create_fdt_sc_dev(RISCVVirtState *s,
+                            uint32_t irq_mmio_phandle)
+{
+    g_autofree char *name = NULL;
+    MachineState *ms = MACHINE(s);
+
+    name = g_strdup_printf("/soc/sc_dev@%lx", s->memmap[VIRT_SC_DEV].base);
+    qemu_fdt_add_subnode(ms->fdt, name);
+    qemu_fdt_setprop_string(ms->fdt, name, "compatible", "my,sc-dev");
+
+    /* Declare register base and size */
+    qemu_fdt_setprop_cells(ms->fdt, name, "reg", 
+                           0x0, s->memmap[VIRT_SC_DEV].base, 
+                           0x0, s->memmap[VIRT_SC_DEV].size);
+
+    /* Interrupts wiring */
+    qemu_fdt_setprop_cell(ms->fdt, name, "interrupt-parent", irq_mmio_phandle);
+        
+    if (s->aia_type == VIRT_AIA_TYPE_NONE) {
+        qemu_fdt_setprop_cells(ms->fdt, name, "interrupts",
+                               SC_DEV_DMA_IRQ,
+                               SC_DEV_CTRL_IRQ);
+    } else {
+        qemu_fdt_setprop_cells(ms->fdt, name, "interrupts",
+                               SC_DEV_DMA_IRQ,  0x4,
+                               SC_DEV_CTRL_IRQ, 0x4);
+    }
+
+}
+
 static void finalize_fdt(RISCVVirtState *s)
 {
     uint32_t phandle = 1, irq_mmio_phandle = 1, msi_pcie_phandle = 1;
@@ -1153,6 +1183,8 @@ static void finalize_fdt(RISCVVirtState *s)
     create_fdt_uart(s, irq_mmio_phandle);
 
     create_fdt_rtc(s, irq_mmio_phandle);
+
+    create_fdt_sc_dev(s, irq_mmio_phandle);
 }
 
 static void create_fdt(RISCVVirtState *s)
@@ -1693,7 +1725,11 @@ static void virt_machine_init(MachineState *machine)
     sifive_test_create(s->memmap[VIRT_TEST].base);
 
     /* SystemC device */
-    sc_dev_create(s->memmap[VIRT_SC_DEV].base);
+    DeviceState *sc_dev = sc_dev_create(s->memmap[VIRT_SC_DEV].base);
+
+    /* Connect SystemC device IRQs to PLIC */
+    sysbus_connect_irq(SYS_BUS_DEVICE(sc_dev), 0, qdev_get_gpio_in(mmio_irqchip, SC_DEV_DMA_IRQ));
+    sysbus_connect_irq(SYS_BUS_DEVICE(sc_dev), 1, qdev_get_gpio_in(mmio_irqchip, SC_DEV_CTRL_IRQ));
 
     /* VirtIO MMIO devices */
     for (i = 0; i < VIRTIO_COUNT; i++) {
