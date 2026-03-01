@@ -98,6 +98,8 @@ enum {
     VIRTIO_COUNT = 8,
     PCIE_IRQ = 0x20, /* 32 to 35 */
     IOMMU_SYS_IRQ = 0x24, /* 36-39 */
+    SC_DEV_DMA_IRQ = 0x28,      /* SC_DEV DMA IRQ (40) */
+    SC_DEV_CTRL_IRQ = 0x29,     /* SC_DEV CTRL IRQ (41) */
     VIRT_PLATFORM_BUS_IRQ = 64, /* 64 to 95 */
 };
 
