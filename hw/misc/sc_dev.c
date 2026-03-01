@@ -10,8 +10,9 @@
 #include "qemu/log.h"			 /* Error logs */
 #include "hw/sysbus.h"  		 /* Provides all sysbus registering functions */
 #include "hw/qdev-properties.h"  /* QEMU device properties */
+#include "hw/irq.h"              /* IRQ functions */
 #include "system/dma.h"          /* DMA functions */
-#include "qemu/timer.h"         /* Timer functions */
+#include "qemu/timer.h"          /* Timer functions */
 
 #include "hw/misc/sc_dev.h"
 
@@ -19,26 +20,51 @@
 typedef struct ScDevState ScDevState;
 DECLARE_INSTANCE_CHECKER(ScDevState, SC_DEV, TYPE_SC_DEV)
 
-#define REG_ID 	0x0
-#define CHIP_ID	0xBA000001
+/* Memory controller registers & bit flags */
+#define REG_CONTROL   0x00       // Control bits (START, READ/WRITE, COMPUTE, IRQ enable)
+#define REG_ADDR      0x04       // Target SRAM address
+#define REG_LEN       0x08       // Transfer size (currently 4 bytes/1 word)
+#define REG_WDATA     0x0C       // Data the CPU wants to write to SRAM
+#define REG_RDATA     0x10       // Data read back from SRAM
+#define REG_STATUS    0x14       // Status bits (BUSY, DONE, ERROR)
 
-/* DMA */
-#define DMA_BUFFER_SIZE 4096   // 4KB
+#define CTRL_START   1u << 0     // b0001, 0x01
+#define CTRL_WRITE   1u << 1     // b0010, 0x02
+#define CTRL_IRQEN   1u << 3     // b0100, 0x04
+#define CTRL_COMPUTE   1u << 4   // b1000, 0x08
 
-#define DMA_CONTROL   0x20     // DMA control
-#define DMA_SRC_LO    0x24     // Lower 32-bits of 64-bit address (Guest RAM)
-#define DMA_SRC_HI    0x28     // Upper 32-bits of 64-bit address (Guest RAM)
-#define DMA_DST       0x2C     // 32-bit address (Device SRAM)
-#define DMA_LEN       0x30     // Length of transfer
-#define DMA_STAT      0x34     // DMA status
+// CTRL STATUS bits
+#define STAT_BUSY   1u << 0      // b0001, 0x01
+#define STAT_DONE   1u << 1      // b0010, 0x02
+#define STAT_ERR    1u << 2      // b0100, 0x04
 
-#define REG_EXCESS_TIME_LO  0x40  // SystemC simulator time correction (upper 32-bits)
-#define REG_EXCESS_TIME_HI  0x44  // SystemC simulator time correction (lower 32-bits)
+/* DMA registers & bit flags */
+#define DMA_BUFFER_SIZE 4096      // 4KB
+
+#define DMA_CONTROL   0x20        // DMA control
+#define DMA_SRC_LO    0x24        // Lower 32-bits of 64-bit address (Guest RAM)
+#define DMA_SRC_HI    0x28        // Upper 32-bits of 64-bit address (Guest RAM)
+#define DMA_DST       0x2C        // 32-bit address (Device SRAM)
+#define DMA_LEN       0x30        // Length of transfer
+#define DMA_STAT      0x34        // DMA status
 
 #define DMA_START     (1 << 0)
 #define DMA_BUSY      (1 << 0)
 #define DMA_DONE      (1 << 1)
 #define DMA_ERR       (1 << 2)
+
+/* Timing registers*/
+#define REG_EXCESS_TIME_LO  0x40  // SystemC simulator time correction (upper 32-bits)
+#define REG_EXCESS_TIME_HI  0x44  // SystemC simulator time correction (lower 32-bits)
+
+/* IRQ registers & bit flags */
+#define REG_IRQ_STATUS  0x60      // Read to find which IRQs are pending
+#define REG_IRQ_CLEAR   0x64      // Write to clear pending IRQs
+#define REG_IRQ_ENABLE  0x68      // Enable or disable IRQs
+
+#define IRQ_CTRL_DONE  (1 << 0)   // b01 - bit 0
+#define IRQ_DMA_DONE   (1 << 1)   // b10 - bit 1
+
 
 /* Forward declarations */
 static void sc_dev_instance_init(Object *obj);
@@ -52,15 +78,17 @@ static uint64_t sc_dev_read(void *opaque, hwaddr addr, unsigned int size);
 static void sc_dev_write(void *opaque, hwaddr addr, uint64_t data, unsigned int size);
 static void sc_dev_dma(ScDevState *state);
 
+static void sc_dev_update_irq(ScDevState* state);
+static void sc_dev_raise_irq(ScDevState* state, uint32_t irq);
+static void sc_dev_clear_irq(ScDevState* state, uint32_t irq);
+
 /* Device state structure 
    Keep track of the status of the device in this board. Specific registers & IRQs may be defined here 
  */
 struct ScDevState {
 	SysBusDevice parent_obj;
-	MemoryRegion iomem;  // Memory mapped space for the device
+	MemoryRegion iomem;   // Memory mapped space for the device
     AddressSpace *dma_as; // DMA address space
-	
-    uint64_t chip_id;
 
     /* DMA registers */
     uint64_t dma_src;
@@ -69,18 +97,28 @@ struct ScDevState {
     uint32_t dma_ctrl;
     uint32_t dma_stat;
 
-	/* Socket connection to external device */
+    /* Interrupts */
+    // DeviceState *irqchip;
+    // uint32_t base_irq;
+    qemu_irq irq_dma;         // DMA completion
+    qemu_irq irq_ctrl;        // Controller/CIM completion
+
+    uint32_t irq_status;      // Pending IRQs (bit 0: controller, bit 1: DMA)
+    uint32_t irq_enable;      // Enabled IRQs (bit 0: controller, bit 1: DMA)
+
+    /* Timing */
+    int64_t excess_time_ns;   // Accumulated "excess" time due to simulated SystemC time being faster than wall-clock time
+
+    /* Socket connection to external device */
     int sc_sock;
     char *socket_path;
-
-    /* Accumulated "excess" time due to simulated SystemC time being faster than wall-clock time */
-    int64_t excess_time_ns; 
 };
 
 struct bridge_msg {
     uint8_t  is_write;
     uint8_t  is_dma;
-    uint16_t reserved; /* Ensure word alignment */
+    uint8_t  ctrl_irq; /* IRQ forwarded from SystemC memory controller*/
+    uint8_t  reserved; /* Ensure word alignment */
 
     uint64_t addr;
     uint32_t size;
@@ -149,6 +187,11 @@ static int8_t sc_dev_tlm_transaction(ScDevState *state,
     qemu_log("sc_dev: txn %lu ns, socket overhead & waiting %lu ns\n", 
               response.simulated_ns, t_delta);
 
+    // Update IRQ based on forwarded SystemC state
+    if (response.ctrl_irq) {
+        sc_dev_raise_irq(state, IRQ_CTRL_DONE);
+    }
+
     /* Copy response data back to caller's buffer (for reads) */
     if (!is_write && buf) {
         memcpy((void*)buf, response.data, size);
@@ -163,20 +206,26 @@ static uint64_t sc_dev_read(void *opaque, hwaddr addr, unsigned int size)
     ScDevState *state = SC_DEV(opaque);
 
     switch (addr) {
-        //case REG_ID:
-        //    return state->chip_id;
+        /* DMA registers */
+        case DMA_STAT:
+            return state->dma_stat;
 
+        /* IRQ registers */
+        case REG_IRQ_STATUS:
+            return state->irq_status;
+
+        case REG_IRQ_ENABLE:
+            return state->irq_enable;
+
+        /* Timing registers */
         case REG_EXCESS_TIME_LO:
             return (uint32_t)(state->excess_time_ns);
         
         case REG_EXCESS_TIME_HI:
             return (uint32_t)(state->excess_time_ns >> 32);
 
-        case DMA_STAT:
-            return state->dma_stat;
-
+        /* Forward register access transaction to SystemC and receive response */
         default:
-            /* Forward transaction to SystemC and receive response */
             uint8_t buf[8] = {0};  // Stack buffer for read data
             uint32_t data = 0;     // First 4 control bytes
             int8_t ret;            // TLM transaction status (tlm::tlm_response_status)
@@ -188,10 +237,24 @@ static uint64_t sc_dev_read(void *opaque, hwaddr addr, unsigned int size)
                 return 0; // TODO: figue out a way to return the TLM error number or some other defined (non-negative) error value
             }
 
-            // TODO: Handle IRQ signal raise/lower
-
             memcpy(&data, buf, sizeof(uint32_t));
             return data;
+    }
+}
+
+/* Helper: forward register access to device */
+static void sc_dev_forward_write(ScDevState *state, hwaddr addr, uint64_t data, unsigned int size)
+{
+    uint8_t buf[8] = {0};  // Buffer for write data
+    int8_t ret;            // TLM transaction status
+
+    memcpy(buf, &data, size);
+
+    ret = sc_dev_tlm_transaction(state, 1, 0, addr, buf, size);
+    if (ret < 0) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "sc_dev: TLM write error at 0x%lx: %d\n",
+                      (unsigned long)addr, ret);
     }
 }
 
@@ -229,21 +292,30 @@ static void sc_dev_write(void *opaque, hwaddr addr,
             state->dma_len = data;
             break;
 
-        /* Control registers (Write but not DMA) */
-        default:
-            uint8_t buf[8] = {0};  // Buffer for write data
-            int8_t ret;            // TLM transaction status
+        /* IRQ registers */
+        case REG_IRQ_ENABLE:
+            state->irq_enable = data;
+            sc_dev_update_irq(state);
+            break;
+        
+        case REG_IRQ_CLEAR:
+            sc_dev_clear_irq(state, data);
 
-            memcpy(buf, &data, size);
-            
-            if ((ret = sc_dev_tlm_transaction(state, 1, 0, addr, buf, size)) < 0) {
-                qemu_log_mask(LOG_GUEST_ERROR,
-                              "sc_dev: TLM write error at 0x%lx: %d\n",
-                              (unsigned long)addr, ret);
+            if (data & IRQ_DMA_DONE) {
+                state->dma_stat = 0;
             }
 
-            // TODO: Handle IRQ signal raise/lower
+            /* Ack the underlying controller condition so SystemC irq goes low.
+             * SystemC controller uses W1C to set REG_STATUS
+             */
+            if (data & IRQ_CTRL_DONE) {
+                sc_dev_forward_write(state, REG_STATUS, STAT_DONE, 4);
+            }
+            break;
 
+        /* Forward register access transaction to SystemC and receive response */
+        default:
+            sc_dev_forward_write(state, addr, data, size);
             break;
     }
 }
@@ -299,7 +371,11 @@ static void sc_dev_dma(ScDevState *state)
         left -= chunk;
     }
 
+    state->dma_ctrl &= ~DMA_START;
     state->dma_stat = DMA_DONE;
+
+    /* Raise DMA completion IRQ */
+    sc_dev_raise_irq(state, IRQ_DMA_DONE);
     
     /* Zero out DMA registers when finished */
     state->dma_src = 0;  
@@ -307,6 +383,28 @@ static void sc_dev_dma(ScDevState *state)
     state->dma_len = 0;  
 }
 
+/* IRQ Helper Functions */
+static void sc_dev_update_irq(ScDevState* state)
+{
+    // Raise level if IRQs are enabled and the specific IRQ bit is set to 1
+    int dma_level = (state->irq_enable & state->irq_status & IRQ_DMA_DONE) ? 1 : 0;
+    int ctrl_level = (state->irq_enable & state->irq_status & IRQ_CTRL_DONE) ? 1 : 0;
+
+    qemu_set_irq(state->irq_dma, dma_level);
+    qemu_set_irq(state->irq_ctrl, ctrl_level);
+}
+
+static void sc_dev_raise_irq(ScDevState* state, uint32_t irq)
+{
+    state->irq_status |= irq;
+    sc_dev_update_irq(state);
+}
+
+static void sc_dev_clear_irq(ScDevState* state, uint32_t irq)
+{
+    state->irq_status &= ~irq;
+    sc_dev_update_irq(state);
+}
 
 /* File operations associated with the device
    “E.g. When CPU reads this memory region, call sc_dev_read()”
@@ -315,6 +413,12 @@ static const MemoryRegionOps sc_dev_ops = {
 	.read = sc_dev_read,
 	.write = sc_dev_write,
 	.endianness = DEVICE_NATIVE_ENDIAN,
+    
+    /* Declare valid number of bytes addressable */
+    .valid = {
+        .min_access_size = 4,
+        .max_access_size = 8,
+    },
 };
 
 /* Device realization.
@@ -354,6 +458,13 @@ static void sc_dev_realize(DeviceState *dev, Error **errp)
     state->dma_stat = 0; 
     
     qemu_log("sc_dev: DMA intialized\n");
+
+    /* Initialize IRQ lines */
+    sysbus_init_irq(SYS_BUS_DEVICE(dev), &state->irq_dma);
+    sysbus_init_irq(SYS_BUS_DEVICE(dev), &state->irq_ctrl);
+
+    qemu_log("sc_dev: IRQ lines intialized\n");
+
 }
 
 /* Device unrealization (socket cleanup) */
@@ -383,8 +494,8 @@ static void sc_dev_instance_init(Object *obj)
 	/* Let the system bus know that this memory region is handled by this device */
 	sysbus_init_mmio(SYS_BUS_DEVICE(obj), &state->iomem); 
 
-	state->chip_id = CHIP_ID;
-	state->sc_sock = -1;  /* Mark as disconnected initially */
+    /* Initially mark socket as disconnected */
+	state->sc_sock = -1;
 }
 
 /* Class initialization */
