@@ -48,7 +48,11 @@ DECLARE_INSTANCE_CHECKER(ScDevState, SC_DEV, TYPE_SC_DEV)
 #define DMA_LEN       0x30        // Length of transfer
 #define DMA_STAT      0x34        // DMA status
 
+/* DMA Control Bit Flags */
 #define DMA_START     (1 << 0)
+#define DMA_DIR_READ  (1 << 1)   /* 0: RAM->SRAM, 1: SRAM->RAM */
+
+/* DMA Status Bit Flags */
 #define DMA_BUSY      (1 << 0)
 #define DMA_DONE      (1 << 1)
 #define DMA_ERR       (1 << 2)
@@ -56,6 +60,9 @@ DECLARE_INSTANCE_CHECKER(ScDevState, SC_DEV, TYPE_SC_DEV)
 /* Timing registers*/
 #define REG_EXCESS_TIME_LO  0x40  // SystemC simulator time correction (upper 32-bits)
 #define REG_EXCESS_TIME_HI  0x44  // SystemC simulator time correction (lower 32-bits)
+
+#define REG_TIMING_CLEAR    0x48  // Write to clear timing data
+#define TIMING_CLEAR        (1 << 0) 
 
 /* IRQ registers & bit flags */
 #define REG_IRQ_STATUS  0x60      // Read to find which IRQs are pending
@@ -92,7 +99,7 @@ struct ScDevState {
 
     /* DMA registers */
     uint64_t dma_src;
-    uint64_t dma_dst;
+    uint32_t dma_dst;
     uint32_t dma_len;
     uint32_t dma_ctrl;
     uint32_t dma_stat;
@@ -184,8 +191,8 @@ static int8_t sc_dev_tlm_transaction(ScDevState *state,
     /* Accumulate correction for excess: wall clock time - simulated time */
     state->excess_time_ns += t_delta - response.simulated_ns;
 
-    qemu_log("sc_dev: txn %lu ns, socket overhead & waiting %lu ns\n", 
-              response.simulated_ns, t_delta);
+    // qemu_log("sc_dev: txn %lu ns, socket overhead & waiting %lu ns\n", 
+    //           response.simulated_ns, t_delta);
 
     // Update IRQ based on forwarded SystemC state
     if (response.ctrl_irq) {
@@ -285,7 +292,7 @@ static void sc_dev_write(void *opaque, hwaddr addr,
             break;
 
         case DMA_DST:
-            state->dma_dst = data;
+            state->dma_dst = (uint32_t)data;
             break;
 
         case DMA_LEN:
@@ -313,6 +320,11 @@ static void sc_dev_write(void *opaque, hwaddr addr,
             }
             break;
 
+        /* Timing registers */
+        case REG_TIMING_CLEAR:
+            state->excess_time_ns = 0;
+            break;
+
         /* Forward register access transaction to SystemC and receive response */
         default:
             sc_dev_forward_write(state, addr, data, size);
@@ -326,61 +338,97 @@ static void sc_dev_write(void *opaque, hwaddr addr,
                           Dest address (where to write to)
                           Data length
 */
-
 static void sc_dev_dma(ScDevState *state)
 {
-    uint8_t buf[DMA_BUFFER_SIZE];    // Temporary storage for data read from memory
-    uint64_t addr = state->dma_src;  // Guest address to read
-    uint64_t dest = state->dma_dst;  // Device address to write into
-    uint32_t left = state->dma_len;  // Total length of read
-    uint32_t chunk = 0;              // Chunk size a single TLM transaction
-    MemTxResult result;              // Result of DMA memory read
+    uint8_t buf[DMA_BUFFER_SIZE];        // Temporary storage for data read from memory
+    uint32_t left = state->dma_len;      // Chunk size a single TLM transaction
+    uint32_t chunk;                      // Chunk size a single TLM transaction
+    MemTxResult result;                  // Result of DMA memory read
+
+    /* Note: I wrote this DMA code with only writes (guest -> dev) in mind. However, because
+     * guest runs in 64-bit and the device in 32-bit, src and dest are not interchangable here.
+     * Therefore I will bodge a small fix, where I keep the original register meanings:
+     *
+     *  - dma_src (64-bit) is ALWAYS guest RAM (AKA guest) address
+     *  - dma_dst (32-bit) is ALWAYS device SRAM address
+     *
+     * Direction bit will decide transfer direction:
+     *  - dir_read == 0 : RAM -> DEV  
+     *  - dir_read == 1 : DEV -> RAM 
+     */
+    uint64_t ram  = state->dma_src;                         // always guest RAM
+    uint64_t dev  = (uint32_t)state->dma_dst;               // always device SRAM (32-bit)
+    bool dir_read = (state->dma_ctrl & DMA_DIR_READ) != 0;  // 1: DEV->RAM
 
     /* TODO: Test to make sure DMA doesn't run if not all three registers are populated */
-    if (!addr || !dest || !left) {
-        qemu_log_mask(LOG_GUEST_ERROR, "dma_src, dma_dst, or dma_len not set.\n");
+    if (!ram || !dev || !left) {
+        qemu_log_mask(LOG_GUEST_ERROR, "sc_dev: dma_src (RAM), dma_dst (DEV), or dma_len not set.\n");
         state->dma_stat = DMA_ERR;
         return;
-    }    
-    
+    }
+
     state->dma_stat = DMA_BUSY;
 
     while (left) {
         chunk = MIN(left, DMA_BUFFER_SIZE);
 
-        /* Read guest RAM */
-        result = dma_memory_read(state->dma_as, addr, buf, chunk, MEMTXATTRS_UNSPECIFIED);
+        /* Write (Guest -> Device) */
+        if (!dir_read) {
+            result = dma_memory_read(state->dma_as, ram, buf, chunk, MEMTXATTRS_UNSPECIFIED);
+            if (result != MEMTX_OK) {
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "sc_dev: DMA RAM read failed at 0x%lx: %d\n",
+                              (unsigned long)ram, result);
+                state->dma_stat = DMA_ERR;
+                return;
+            }
 
-        if (result != MEMTX_OK) {
-            qemu_log_mask(LOG_GUEST_ERROR,
-                          "sc_dev: DMA read failed at 0x%lx: %d\n",
-                          (unsigned long)addr, result);
-            state->dma_stat = DMA_ERR;
-            return;
+            if (sc_dev_tlm_transaction(state, 1, 1, dev, buf, chunk) < 0) {
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "sc_dev: DMA write-to-device failed (dev=0x%lx len=%u)\n",
+                              (unsigned long)dev, chunk);
+                state->dma_stat = DMA_ERR;
+                return;
+            }
+        
+        /* Read (Device -> Guest) */
+        } else {
+            /* Read from SystemC/device SRAM into buf */
+            if (sc_dev_tlm_transaction(state, 0, 1, dev, buf, chunk) < 0) {
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "sc_dev: DMA read-from-device failed (dev=0x%lx len=%u)\n",
+                              (unsigned long)dev, chunk);
+                state->dma_stat = DMA_ERR;
+                return;
+            }
+
+            /* Write buf into guest RAM */
+            result = dma_memory_write(state->dma_as, ram, buf, chunk, MEMTXATTRS_UNSPECIFIED);
+            if (result != MEMTX_OK) {
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "sc_dev: DMA RAM write failed at 0x%lx: %d\n",
+                              (unsigned long)ram, result);
+                state->dma_stat = DMA_ERR;
+                return;
+            }
         }
-
-        /* Send to SystemC the chunked buffer data */
-        if (sc_dev_tlm_transaction(state, 1, 1, dest, buf, chunk) < 0) {
-            state->dma_stat = DMA_ERR;
-            return;
-        }
-
+        
         /* Increment addresses and decrement remaining chunks */
-        addr += chunk;
-        dest += chunk;
+        ram  += chunk;
+        dev  += chunk;
         left -= chunk;
     }
 
+    /* Raise DMA completion IRQ */
     state->dma_ctrl &= ~DMA_START;
     state->dma_stat = DMA_DONE;
 
-    /* Raise DMA completion IRQ */
     sc_dev_raise_irq(state, IRQ_DMA_DONE);
-    
+
     /* Zero out DMA registers when finished */
-    state->dma_src = 0;  
-    state->dma_dst = 0;  
-    state->dma_len = 0;  
+    state->dma_src = 0;
+    state->dma_dst = 0;
+    state->dma_len = 0;
 }
 
 /* IRQ Helper Functions */
