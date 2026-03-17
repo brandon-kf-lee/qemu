@@ -1,4 +1,4 @@
-
+// sc-dev.c
 // TODO: hw/riscv/virt.c     [VIRT_SC_DEV] =       {  0x8000000,         0x100 },
 // MMIO callbacks to SystemC device
 
@@ -105,8 +105,6 @@ struct ScDevState {
     uint32_t dma_stat;
 
     /* Interrupts */
-    // DeviceState *irqchip;
-    // uint32_t base_irq;
     qemu_irq irq_dma;         // DMA completion
     qemu_irq irq_ctrl;        // Controller/CIM completion
 
@@ -141,7 +139,7 @@ struct bridge_msg {
    Returns status of transaction, forwarded from SystemC
  */
 static int8_t sc_dev_tlm_transaction(ScDevState *state, 
-									   uint8_t is_write, uint8_t is_dma, 
+                                       uint8_t is_write, uint8_t is_dma, 
                                        uint64_t addr, void *buf, uint32_t size)
 {
     struct bridge_msg msg = {
@@ -154,8 +152,8 @@ static int8_t sc_dev_tlm_transaction(ScDevState *state,
     };    
     struct bridge_msg response;
     ssize_t ret;
-    int64_t t_before, t_after, t_delta; // Used to correct for simulated time
-
+    int64_t t_rt_before, t_rt_after, t_round_trip; // Used to time full round trip simulated time (socket send -> SystemC -> socket recv)
+    
     /* Copy data buffer into message if writing */
     if (is_write && buf) {
         memcpy(msg.data, buf, size);
@@ -168,7 +166,7 @@ static int8_t sc_dev_tlm_transaction(ScDevState *state,
     }
 
     /* Mark time before entering SystemC time */
-    t_before = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    t_rt_before = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
 
     /* Send request, error if message wasn't sent */
     ret = send(state->sc_sock, &msg, sizeof(msg), 0);
@@ -185,14 +183,19 @@ static int8_t sc_dev_tlm_transaction(ScDevState *state,
     }
 
     /* Mark time after returning from SystemC time */
-    t_after = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    t_delta = t_after - t_before;
+    t_rt_after = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    t_round_trip = t_rt_after - t_rt_before;
 
     /* Accumulate correction for excess: wall clock time - simulated time */
-    state->excess_time_ns += t_delta - response.simulated_ns;
+    state->excess_time_ns += t_round_trip - response.simulated_ns;
 
-    // qemu_log("sc_dev: txn %lu ns, socket overhead & waiting %lu ns\n", 
-    //           response.simulated_ns, t_delta);
+    // qemu_log("sc_dev: %s %s addr=0x%04lx size=%04u | sim=%05" PRIu64 " wall=%06" PRIu64 " overhead=%" PRId64 "\n",
+    //      is_dma ? " DMA" : "MMIO",
+    //      is_write ? "WR" : "RD",
+    //      (unsigned long)addr, (unsigned)size,
+    //      (uint64_t)response.simulated_ns,
+    //      (uint64_t)t_round_trip,
+    //      (int64_t)(t_round_trip - response.simulated_ns));
 
     // Update IRQ based on forwarded SystemC state
     if (response.ctrl_irq) {
