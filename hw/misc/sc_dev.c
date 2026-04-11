@@ -39,7 +39,7 @@ DECLARE_INSTANCE_CHECKER(ScDevState, SC_DEV, TYPE_SC_DEV)
 #define STAT_ERR    1u << 2      // b0100, 0x04
 
 /* DMA registers & bit flags */
-#define DMA_BUFFER_SIZE 4096      // 4KB
+#define DMA_BUFFER_SIZE (16 * 1024 * 1024)   // 16MB maximum burst size
 
 #define DMA_CONTROL   0x20        // DMA control
 #define DMA_SRC_LO    0x24        // Lower 32-bits of 64-bit address (Guest RAM)
@@ -69,8 +69,29 @@ DECLARE_INSTANCE_CHECKER(ScDevState, SC_DEV, TYPE_SC_DEV)
 #define REG_IRQ_CLEAR   0x64      // Write to clear pending IRQs
 #define REG_IRQ_ENABLE  0x68      // Enable or disable IRQs
 
-#define IRQ_CTRL_DONE  (1 << 0)   // b01 - bit 0
-#define IRQ_DMA_DONE   (1 << 1)   // b10 - bit 1
+#define IRQ_CTRL_DONE  (1 << 0)   // b001 - bit 0
+#define IRQ_DMA_DONE   (1 << 1)   // b010 - bit 1
+#define IRQ_JOB_DONE   (1 << 2)   // b100 - bit 2
+
+/* Job registers & bit flags */
+#define REG_JOB_CONTROL     0x80 // write 1 to start Job (end-to-end inference)
+#define REG_JOB_STATUS      0x84 // DONE/BUSY/ERR
+
+#define REG_JOB_IN_SRC_LO   0x88
+#define REG_JOB_IN_SRC_HI   0x8C
+#define REG_JOB_IN_DST      0x90
+#define REG_JOB_IN_LEN      0x94
+
+#define REG_JOB_OUT_SRC     0x98
+#define REG_JOB_OUT_DST_LO  0x9C
+#define REG_JOB_OUT_DST_HI  0xA0
+#define REG_JOB_OUT_LEN     0xA4
+
+#define JOB_START           (1u << 0)
+
+#define JOB_BUSY            (1u << 0)
+#define JOB_DONE            (1u << 1)
+#define JOB_ERR             (1u << 2)
 
 
 /* Forward declarations */
@@ -84,6 +105,8 @@ static int8_t sc_dev_tlm_transaction(ScDevState *state,
 static uint64_t sc_dev_read(void *opaque, hwaddr addr, unsigned int size);
 static void sc_dev_write(void *opaque, hwaddr addr, uint64_t data, unsigned int size);
 static void sc_dev_dma(ScDevState *state);
+static void sc_dev_run_job(ScDevState *state);
+// static void sc_dev_job_bh(void *opaque);
 
 static void sc_dev_update_irq(ScDevState* state);
 static void sc_dev_raise_irq(ScDevState* state, uint32_t irq);
@@ -107,9 +130,34 @@ struct ScDevState {
     /* Interrupts */
     qemu_irq irq_dma;         // DMA completion
     qemu_irq irq_ctrl;        // Controller/CIM completion
+    qemu_irq irq_job;         // End-to-end inference completion
 
     uint32_t irq_status;      // Pending IRQs (bit 0: controller, bit 1: DMA)
     uint32_t irq_enable;      // Enabled IRQs (bit 0: controller, bit 1: DMA)
+
+    /*  Job registers/state 
+     *  Job mode: runs one inference end-to-end
+     *  1. Perform DMA write-to-device using sc_dev_dma() logic
+     *  2. Trigger compute (SystemC ctrl transaction)
+     *  3. Perform DMA read-from-device
+    */
+    uint32_t job_control;
+    uint32_t job_status;
+
+    uint64_t job_in_src;
+    uint32_t job_in_dst;
+    uint32_t job_in_len;
+
+    uint32_t job_out_src;
+    uint64_t job_out_dst;
+    uint32_t job_out_len;
+
+    bool job_mode_active;
+
+    /* Bottom half: Run Job asynchronously */
+    // QEMUBH *job_bh;
+    // bool job_pending;
+    // bool job_running;
 
     /* Timing */
     int64_t excess_time_ns;   // Accumulated "excess" time due to simulated SystemC time being faster than wall-clock time
@@ -118,6 +166,8 @@ struct ScDevState {
     int sc_sock;
     char *socket_path;
 };
+
+#define BRIDGE_HEADER_SIZE sizeof(struct bridge_msg)
 
 struct bridge_msg {
     uint8_t  is_write;
@@ -128,19 +178,41 @@ struct bridge_msg {
     uint64_t addr;
     uint32_t size;
 
-    uint8_t  data[DMA_BUFFER_SIZE];
-    int64_t simulated_ns;
-
-    int8_t status;
+    uint64_t simulated_ns;
+    int8_t   status;
+    uint8_t  pad[7];   /* keep alignment/size neat */
 } __attribute__((packed));  /* Ensure no padding */
 
+static int send_all(int fd, const void *buf, size_t len)
+{
+    const uint8_t *p = buf;
+    while (len) {
+        ssize_t n = send(fd, p, len, MSG_NOSIGNAL); // Prevents crash on disconnect
+        if (n <= 0) return -1;
+        p += (size_t)n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+static int recv_all(int fd, void *buf, size_t len)
+{
+    uint8_t *p = buf;
+    while (len) {
+        ssize_t n = recv(fd, p, len, MSG_WAITALL);
+        if (n <= 0) return -1;
+        p += (size_t)n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
 
 /* Helper: Send and receive messages formatted for TLM transactions. 
    Returns status of transaction, forwarded from SystemC
  */
-static int8_t sc_dev_tlm_transaction(ScDevState *state, 
-                                       uint8_t is_write, uint8_t is_dma, 
-                                       uint64_t addr, void *buf, uint32_t size)
+static int8_t sc_dev_tlm_transaction(ScDevState *state,
+                                     uint8_t is_write, uint8_t is_dma,
+                                     uint64_t addr, void *buf, uint32_t size)
 {
     struct bridge_msg msg = {
         .is_write = is_write,
@@ -151,13 +223,8 @@ static int8_t sc_dev_tlm_transaction(ScDevState *state,
         .status = 0,  /* Code for incomplete message */
     };    
     struct bridge_msg response;
-    ssize_t ret;
     int64_t t_rt_before, t_rt_after, t_round_trip; // Used to time full round trip simulated time (socket send -> SystemC -> socket recv)
-    
-    /* Copy data buffer into message if writing */
-    if (is_write && buf) {
-        memcpy(msg.data, buf, size);
-    }
+
 
 	/* Ensure bridge socket connection */
     if (state->sc_sock < 0) {
@@ -165,21 +232,41 @@ static int8_t sc_dev_tlm_transaction(ScDevState *state,
         return -1;
     }
 
-    /* Mark time before entering SystemC time */
-    t_rt_before = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
-
-    /* Send request, error if message wasn't sent */
-    ret = send(state->sc_sock, &msg, sizeof(msg), 0);
-    if (ret != sizeof(msg)) {
-        qemu_log_mask(LOG_GUEST_ERROR, "sc_dev: failed to send TLM message\n");
+    /* Safety: never claim more than payload capacity per transaction */
+    if (size > DMA_BUFFER_SIZE) {
+        qemu_log_mask(LOG_GUEST_ERROR, "sc_dev: TLM size %u exceeds DMA_BUFFER_SIZE\n", size);
         return -1;
     }
 
-    /* Receive response, error if nothing was received */
-    ret = recv(state->sc_sock, &response, sizeof(response), MSG_WAITALL);
-    if (ret != sizeof(response)) {
-        qemu_log_mask(LOG_GUEST_ERROR, "sc_dev: failed to receive TLM response\n");
+    /* Mark time before entering SystemC time */
+    t_rt_before = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+
+    /* ---- send header ---- */
+    if (send_all(state->sc_sock, &msg, BRIDGE_HEADER_SIZE) < 0) {
+        qemu_log_mask(LOG_GUEST_ERROR, "sc_dev: failed to send TLM header\n");
         return -1;
+    }
+
+    /* send payload only for writes with size > 0 */
+    if (is_write && size > 0 && buf) {
+        if (send_all(state->sc_sock, buf, size) < 0) {
+            qemu_log_mask(LOG_GUEST_ERROR, "sc_dev: failed to send TLM payload\n");
+            return -1;
+        }
+    }
+
+    /* ---- recv response header ---- */
+    if (recv_all(state->sc_sock, &response, BRIDGE_HEADER_SIZE) < 0) {
+        qemu_log_mask(LOG_GUEST_ERROR, "sc_dev: failed to recv TLM header\n");
+        return -1;
+    }
+
+    /* recv payload only for reads with size > 0 */
+    if (!is_write && size > 0 && buf) {
+        if (recv_all(state->sc_sock, buf, size) < 0) {
+            qemu_log_mask(LOG_GUEST_ERROR, "sc_dev: failed to recv TLM payload\n");
+            return -1;
+        }
     }
 
     /* Mark time after returning from SystemC time */
@@ -197,16 +284,11 @@ static int8_t sc_dev_tlm_transaction(ScDevState *state,
     //      (uint64_t)t_round_trip,
     //      (int64_t)(t_round_trip - response.simulated_ns));
 
-    // Update IRQ based on forwarded SystemC state
-    if (response.ctrl_irq) {
+    /* Forward controller IRQ (if not in Job mode) */
+    if (response.ctrl_irq && !state->job_mode_active) {
         sc_dev_raise_irq(state, IRQ_CTRL_DONE);
     }
 
-    /* Copy response data back to caller's buffer (for reads) */
-    if (!is_write && buf) {
-        memcpy((void*)buf, response.data, size);
-    }
-    
     return response.status;
 }
 
@@ -226,6 +308,10 @@ static uint64_t sc_dev_read(void *opaque, hwaddr addr, unsigned int size)
 
         case REG_IRQ_ENABLE:
             return state->irq_enable;
+
+        /* Job registers */
+        case REG_JOB_STATUS:
+            return state->job_status;
 
         /* Timing registers */
         case REG_EXCESS_TIME_LO:
@@ -302,6 +388,7 @@ static void sc_dev_write(void *opaque, hwaddr addr,
             state->dma_len = data;
             break;
 
+
         /* IRQ registers */
         case REG_IRQ_ENABLE:
             state->irq_enable = data;
@@ -323,10 +410,77 @@ static void sc_dev_write(void *opaque, hwaddr addr,
             }
             break;
 
+
+        /* Job registers */
+        case REG_JOB_IN_SRC_LO:
+            state->job_in_src &= 0xffffffff00000000ULL;
+            state->job_in_src |= (uint32_t)data;
+            break;
+        case REG_JOB_IN_SRC_HI:
+            state->job_in_src &= 0x00000000ffffffffULL;
+            state->job_in_src |= ((uint64_t)(uint32_t)data << 32);
+            break;
+        case REG_JOB_IN_DST:
+            state->job_in_dst = (uint32_t)data;
+            break;
+        case REG_JOB_IN_LEN:
+            state->job_in_len = (uint32_t)data;
+            break;
+            
+        case REG_JOB_OUT_SRC:
+            state->job_out_src = (uint32_t)data;
+            break;
+        case REG_JOB_OUT_DST_LO:
+            state->job_out_dst &= 0xffffffff00000000ULL;
+            state->job_out_dst |= (uint32_t)data;
+            break;
+        case REG_JOB_OUT_DST_HI:
+            state->job_out_dst &= 0x00000000ffffffffULL;
+            state->job_out_dst |= ((uint64_t)(uint32_t)data << 32);
+            break;
+        case REG_JOB_OUT_LEN:
+            state->job_out_len = (uint32_t)data;
+            break;
+            
+        // case REG_JOB_CONTROL:
+        //     state->job_control = (uint32_t)data;
+
+        //     /* Schedule job separately through QEMU bottom half */
+        //     if (state->job_control & JOB_START) {
+        //         /* prevent re-entry / overlapping jobs */
+        //         if (!state->job_running) {
+        //             state->job_status = JOB_BUSY;
+        //             state->job_pending = true;
+        //             qemu_bh_schedule(state->job_bh);
+        //         } else {
+        //             /* already running: set error */
+        //             state->job_status = JOB_ERR;
+        //         }
+        //     }
+        //     break;
+
+        case REG_JOB_CONTROL:
+            state->job_control = (uint32_t)data;
+
+            if (state->job_control & JOB_START) {
+                /*
+                 * Synchronous job execution: this MMIO write will block until
+                 * input DMA + compute + output DMA complete.
+                 */
+                if (!state->job_mode_active) {
+                    sc_dev_run_job(state);
+                } else {
+                    state->job_status = JOB_ERR;
+                }
+            }
+            break;
+
+
         /* Timing registers */
         case REG_TIMING_CLEAR:
             state->excess_time_ns = 0;
             break;
+
 
         /* Forward register access transaction to SystemC and receive response */
         default:
@@ -343,10 +497,10 @@ static void sc_dev_write(void *opaque, hwaddr addr,
 */
 static void sc_dev_dma(ScDevState *state)
 {
-    uint8_t buf[DMA_BUFFER_SIZE];        // Temporary storage for data read from memory
-    uint32_t left = state->dma_len;      // Chunk size a single TLM transaction
-    uint32_t chunk;                      // Chunk size a single TLM transaction
-    MemTxResult result;                  // Result of DMA memory read
+    uint8_t *buf = g_malloc(DMA_BUFFER_SIZE); // Temporary heap storage for data read from memory
+    uint32_t left = state->dma_len;           // Chunk size a single TLM transaction
+    uint32_t chunk;                           // Chunk size a single TLM transaction
+    MemTxResult result;                       // Result of DMA memory read
 
     /* Note: I wrote this DMA code with only writes (guest -> dev) in mind. However, because
      * guest runs in 64-bit and the device in 32-bit, src and dest are not interchangable here.
@@ -426,13 +580,95 @@ static void sc_dev_dma(ScDevState *state)
     state->dma_ctrl &= ~DMA_START;
     state->dma_stat = DMA_DONE;
 
-    sc_dev_raise_irq(state, IRQ_DMA_DONE);
+    /* Only raise IRQ if not part of a Job */
+    if (!state->job_mode_active) sc_dev_raise_irq(state, IRQ_DMA_DONE);
 
     /* Zero out DMA registers when finished */
     state->dma_src = 0;
     state->dma_dst = 0;
     state->dma_len = 0;
+
+    /* Clean up the heap memory */
+    g_free(buf);
 }
+
+/* Perform an end-to-end inference and raise one interrupt on completion*/
+static void sc_dev_run_job(ScDevState *state)
+{
+    /* basic validation */
+    if (!state->job_in_src || !state->job_in_dst || !state->job_in_len ||
+        !state->job_out_dst || !state->job_out_src || !state->job_out_len) {
+        state->job_status = JOB_ERR;
+        return;
+    }
+
+    state->job_status = JOB_BUSY;
+    state->job_mode_active = true;
+
+    /* ---------- Step 1: input DMA (RAM -> SRAM) ---------- */
+    state->dma_src  = state->job_in_src;
+    state->dma_dst  = state->job_in_dst;
+    state->dma_len  = state->job_in_len;
+    state->dma_ctrl = DMA_START;            /* write direction */
+    sc_dev_dma(state);                      /* performs the copy + socket txns */
+    /* IRQ_DMA_DONE is not raised in Job mode */
+
+
+    /* ---------- Step 2: compute ---------- */
+    /* Trigger compute in SystemC via existing MMIO control path.*/
+    sc_dev_forward_write(state, REG_LEN, 4, 4);
+    sc_dev_forward_write(state, REG_CONTROL, (CTRL_IRQEN | CTRL_COMPUTE | CTRL_START), 4);
+
+    /* IRQ_CTRL_DONE is not raised in Job mode */
+
+
+    /* ---------- Step 3: output DMA (SRAM -> RAM) ---------- */
+    state->dma_src  = state->job_out_dst;   /* dma_src is always RAM */
+    state->dma_dst  = state->job_out_src;   /* dma_dst always DEV SRAM address */
+    state->dma_len  = state->job_out_len;
+    state->dma_ctrl = DMA_START | DMA_DIR_READ;
+    sc_dev_dma(state);
+
+    /* done */
+    state->job_mode_active = false;
+    state->job_status = JOB_DONE;
+
+    /* right before sc_dev_raise_irq(state, IRQ_JOB_DONE); */
+    // struct timespec ts = {.tv_sec = 0, .tv_nsec = 100000000}; // 100ms
+    // nanosleep(&ts, NULL);
+
+    sc_dev_raise_irq(state, IRQ_JOB_DONE);
+}
+
+/*
+ * Job bottom half (BH) handler.
+ *
+ * We schedule this BH when the guest writes JOB_START. The MMIO write callback
+ * returns immediately to the guest, and the actual Job execution runs later in
+ * QEMU’s main event loop context (BH), not inline in the vCPU MMIO path.
+ *
+ * Note: sc_dev_run_job() is currently synchronous: it performs input DMA,
+ * triggers compute via the SystemC socket bridge, then performs output DMA,
+ * all sequentially and blocking. This means the BH itself may run for a while,
+ * but the guest sees a "doorbell + wait" programming model: issue JOB_START,
+ * then block waiting for IRQ_JOB_DONE.
+ */
+// static void sc_dev_job_bh(void *opaque)
+// {
+//     ScDevState *state = opaque;
+
+//     if (!state->job_pending || state->job_running) {
+//         return;
+//     }
+
+//     state->job_pending = false;
+//     state->job_running = true;
+
+//     /* Run the job */
+//     sc_dev_run_job(state);
+
+//     state->job_running = false;
+// }
 
 /* IRQ Helper Functions */
 static void sc_dev_update_irq(ScDevState* state)
@@ -440,9 +676,11 @@ static void sc_dev_update_irq(ScDevState* state)
     // Raise level if IRQs are enabled and the specific IRQ bit is set to 1
     int dma_level = (state->irq_enable & state->irq_status & IRQ_DMA_DONE) ? 1 : 0;
     int ctrl_level = (state->irq_enable & state->irq_status & IRQ_CTRL_DONE) ? 1 : 0;
+    int job_level = (state->irq_enable & state->irq_status & IRQ_JOB_DONE) ? 1 : 0;
 
     qemu_set_irq(state->irq_dma, dma_level);
     qemu_set_irq(state->irq_ctrl, ctrl_level);
+    qemu_set_irq(state->irq_job, job_level);
 }
 
 static void sc_dev_raise_irq(ScDevState* state, uint32_t irq)
@@ -513,8 +751,16 @@ static void sc_dev_realize(DeviceState *dev, Error **errp)
     /* Initialize IRQ lines */
     sysbus_init_irq(SYS_BUS_DEVICE(dev), &state->irq_dma);
     sysbus_init_irq(SYS_BUS_DEVICE(dev), &state->irq_ctrl);
+    sysbus_init_irq(SYS_BUS_DEVICE(dev), &state->irq_job);
 
     qemu_log("sc_dev: IRQ lines intialized\n");
+
+    /* Create a new bottom half for Job */
+    // state->job_pending = false;
+    // state->job_running = false;
+    // state->job_bh = qemu_bh_new(sc_dev_job_bh, state);
+
+    // qemu_log("sc_dev: \"Job\" bottom half intialized\n");
 
 }
 
@@ -527,6 +773,11 @@ static void sc_dev_unrealize(DeviceState *dev)
         close(state->sc_sock);
         state->sc_sock = -1;
     }
+
+    // if (state->job_bh) {
+    //     qemu_bh_delete(state->job_bh);
+    //     state->job_bh = NULL;
+    // }
 }
 
 /* Device properties */

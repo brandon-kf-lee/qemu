@@ -1150,11 +1150,13 @@ static void create_fdt_sc_dev(RISCVVirtState *s,
     if (s->aia_type == VIRT_AIA_TYPE_NONE) {
         qemu_fdt_setprop_cells(ms->fdt, name, "interrupts",
                                SC_DEV_DMA_IRQ,
-                               SC_DEV_CTRL_IRQ);
+                               SC_DEV_CTRL_IRQ,
+                               SC_DEV_JOB_IRQ);
     } else {
         qemu_fdt_setprop_cells(ms->fdt, name, "interrupts",
                                SC_DEV_DMA_IRQ,  0x4,
-                               SC_DEV_CTRL_IRQ, 0x4);
+                               SC_DEV_CTRL_IRQ, 0x4,
+                               SC_DEV_JOB_IRQ, 0x4);
     }
 
 }
@@ -1730,6 +1732,7 @@ static void virt_machine_init(MachineState *machine)
     /* Connect SystemC device IRQs to PLIC */
     sysbus_connect_irq(SYS_BUS_DEVICE(sc_dev), 0, qdev_get_gpio_in(mmio_irqchip, SC_DEV_DMA_IRQ));
     sysbus_connect_irq(SYS_BUS_DEVICE(sc_dev), 1, qdev_get_gpio_in(mmio_irqchip, SC_DEV_CTRL_IRQ));
+    sysbus_connect_irq(SYS_BUS_DEVICE(sc_dev), 2, qdev_get_gpio_in(mmio_irqchip, SC_DEV_JOB_IRQ));
 
     /* VirtIO MMIO devices */
     for (i = 0; i < VIRTIO_COUNT; i++) {
